@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import math
 import numpy as np
 
 from math import sqrt
@@ -126,8 +127,8 @@ class ProbAttention(nn.Module):
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, n_heads, 
-                 d_keys=None, d_values=None, mix=False):
+    def __init__(self, attention, d_model, n_heads, qs = True,
+                 d_keys=None, d_values=None, mix=False,):
         super(AttentionLayer, self).__init__()
 
         d_keys = d_keys or (d_model//n_heads)
@@ -140,15 +141,25 @@ class AttentionLayer(nn.Module):
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
         self.n_heads = n_heads
         self.mix = mix
+        self.qs = qs
 
     def forward(self, queries, keys, values, attn_mask):
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
 
-        queries = self.query_projection(queries).view(B, L, H, -1)
-        keys = self.key_projection(keys).view(B, S, H, -1)
-        values = self.value_projection(values).view(B, S, H, -1)
+        queries = self.query_projection(queries)
+        #queries = queries.view(B, L, H, -1)
+        keys = self.key_projection(keys) #.view(B, S, H, -1)
+        #print("keys outer attention:",keys.shape)
+        values = self.value_projection(values) #.view(B, S, H, -1)
+        #print("Valuess outer attention:",values.shape)
+
+        if (self.qs == False):
+            queries = queries.view(B, L, H, -1)
+            keys = keys.view(B, S, H, -1)
+            values = values.view(B, S, H, -1)
+
 
         out, attn = self.inner_attention(
             queries,
@@ -161,3 +172,28 @@ class AttentionLayer(nn.Module):
         out = out.view(B, L, -1)
 
         return self.out_projection(out), attn
+
+
+class QuerySelector(nn.Module):
+    def __init__(self, fraction=0.33,mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
+        super(QuerySelector, self).__init__()
+        self.fraction = fraction
+
+    def forward(self, queries, keys, values,attn_mask = None):
+        B, L_Q, D = queries.shape
+        _, L_K, _ = keys.shape
+        l_Q = int((1.0 - self.fraction) * L_Q)
+        K_reduce = torch.mean(keys.topk(l_Q, dim=1).values, dim=1).unsqueeze(1)
+        sqk = torch.matmul(K_reduce, queries.transpose(1,2))
+        indices = sqk.topk(l_Q, dim=-1).indices.squeeze(1)
+        Q_sample = queries[torch.arange(B)[:, None], indices, :]  # factor*ln(L_q)
+        Q_K = torch.matmul(Q_sample, keys.transpose(-2, -1))
+        attn = torch.softmax(Q_K / math.sqrt(D), dim=-1)
+        mean_values = values.mean(dim=-2)
+        result = mean_values.unsqueeze(-2).expand(B, L_Q, mean_values.shape[-1]).clone()
+        result[torch.arange(B)[:, None], indices, :] = torch.matmul(attn, values).type_as(result)
+        return result, None
+
+    def inference(self):
+        pass # no parameters
+
